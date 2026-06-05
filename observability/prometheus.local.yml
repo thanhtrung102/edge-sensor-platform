@@ -1,0 +1,18 @@
+# Native (non-Docker) Prometheus config — scrapes the agent on localhost.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: edge-agents
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
+        labels: { fleet: techvalley-demo }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
