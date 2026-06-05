@@ -13,6 +13,7 @@ data:
   S3_BUCKET: edge-data
   ANOMALY_RATE: "0.03"
   BUFFER_DIR: /data/buffer
+  MAX_BUFFER_BYTES: "536870912"   # 512 MiB store-and-forward cap (drop-oldest beyond this)
 ---
 apiVersion: apps/v1
 kind: DaemonSet

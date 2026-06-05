@@ -1,5 +1,7 @@
 # Edge-to-Cloud Sensor & Camera Data-Collection Platform
 
+[![ci](https://github.com/thanhtrung102/edge-sensor-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/thanhtrung102/edge-sensor-platform/actions/workflows/ci.yml)
+
 A robotics/manufacturing-style **edge-to-cloud** telemetry pipeline: edge agents capture
 **camera frames + sensor readings**, buffer them to local disk for **field/offline reliability**,
 upload to **S3-compatible object storage** with retry, and surface **fleet health + alerts** through a
@@ -99,3 +101,13 @@ on k3s locally; lifts to **EKS** by swapping MinIO for S3 (IRSA). See [k8s/READM
 - **On-site ops automation** (self-health, auto-restart, offline-tolerant retry, escalation alerts)
 - **Cameras/sensors + local storage** (USB-camera-ready, sensor telemetry, local ring-buffer)
 - **DevOps / Kubernetes** — Docker Compose, native, and k3s/EKS manifests (DaemonSet + CronJob)
+- **CI/CD + IaC** — GitHub Actions (lint · agent tests · dbt build · image build · kustomize validate · `terraform validate`) and **Terraform** for the real AWS S3 landing target (`terraform/`)
+
+## Reliability & correctness details
+- **Capture-time partitioning** — objects are keyed by their *capture* time (parsed from the buffered
+  filename), not upload time, so data buffered through an outage still lands in the correct `Y/M/D/H`
+  partition (otherwise late arrivals scatter into the wrong hour and break partition pruning).
+- **Bounded store-and-forward buffer** — past `MAX_BUFFER_BYTES` the agent drops oldest-first
+  (`edge_buffer_evicted_total`), so a long outage can't fill the disk and take the node down.
+- **Tested** — `pytest tests/` covers the partitioning and buffer-eviction logic; `dbt test` covers
+  the marts. Both run in CI on every push.

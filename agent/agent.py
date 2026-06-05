@@ -39,6 +39,9 @@ S3_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET = os.getenv("S3_SECRET_KEY", "minioadmin")
 SENSORS = ["temperature_c", "vibration_g", "humidity_pct"]
 ANOMALY_RATE = float(os.getenv("ANOMALY_RATE", "0.03"))
+# Hard cap on the local store-and-forward buffer. A long outage must not fill the disk and
+# take the node down; past this size we drop the OLDEST buffered files (newest data wins).
+MAX_BUFFER_BYTES = int(os.getenv("MAX_BUFFER_BYTES", str(512 * 1024 * 1024)))  # 512 MiB
 
 BUFFER_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -74,6 +77,7 @@ uploads = Counter("edge_uploads_total", "Object uploads", ["device_id", "site", 
 anomalies = Counter("edge_sensor_anomaly_total", "Sensor anomalies detected", ["device_id", "site", "sensor"])
 backlog = Gauge("edge_upload_backlog_files", "Files awaiting upload in local buffer", ["device_id", "site"])
 buffer_bytes = Gauge("edge_buffer_disk_bytes", "Local buffer size on disk (bytes)", ["device_id", "site"])
+evicted = Counter("edge_buffer_evicted_total", "Buffered files dropped (oldest-first) at buffer cap", ["device_id", "site"])
 last_capture = Gauge("edge_last_capture_timestamp_seconds", "Unix ts of last capture", ["device_id", "site"])
 last_upload = Gauge("edge_last_successful_upload_timestamp_seconds", "Unix ts of last upload", ["device_id", "site"])
 sensor_reading = Gauge("edge_sensor_reading", "Latest sensor reading", ["device_id", "site", "sensor"])
@@ -159,15 +163,52 @@ def _s3():
     )
 
 
+def _capture_time(path: Path) -> datetime:
+    """Recover capture time from the buffered filename (``frame_<stamp>`` / ``sensors_<stamp>``,
+    stamp = ``%Y%m%dT%H%M%S%f``). Falls back to file mtime if the name is unexpected.
+
+    Critical for correctness: data buffered during an outage must land in its *capture*-time
+    partition, not the *upload*-time partition. Partitioning by upload time silently scatters
+    late-arriving data into the wrong hour, breaking time-range queries / Athena partition pruning.
+    """
+    _, _, stamp = path.stem.partition("_")
+    try:
+        return datetime.strptime(stamp, "%Y%m%dT%H%M%S%f").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+
+
 def _key_for(path: Path) -> str:
     kind = "frames" if path.suffix == ".jpg" else "sensors"
-    now = datetime.now(timezone.utc)
-    return f"{DEVICE_ID}/{kind}/{now:%Y/%m/%d/%H}/{path.name}"
+    t = _capture_time(path)
+    return f"{DEVICE_ID}/{kind}/{t:%Y/%m/%d/%H}/{path.name}"
+
+
+def _enforce_buffer_cap(files: list) -> list:
+    """Drop oldest-first until the buffer is under MAX_BUFFER_BYTES. Returns the survivors.
+    `files` must be ordered oldest-first. This bounds disk use during long outages — the
+    store-and-forward equivalent of Fluent Bit's filesystem buffer size limit."""
+    total = sum(p.stat().st_size for p in files)
+    dropped = 0
+    while total > MAX_BUFFER_BYTES and dropped < len(files):
+        victim = files[dropped]
+        try:
+            total -= victim.stat().st_size
+            victim.unlink(missing_ok=True)
+        except OSError:
+            pass
+        evicted.labels(**LBL).inc()
+        dropped += 1
+    if dropped:
+        log.warning("buffer_cap_evicted", {"evicted": dropped, "cap_bytes": MAX_BUFFER_BYTES})
+    return files[dropped:]
 
 
 def upload_loop():
     while True:
-        files = sorted(p for p in BUFFER_DIR.iterdir() if p.is_file())
+        # oldest-first by mtime so upload order and eviction order are both chronological
+        files = sorted((p for p in BUFFER_DIR.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime)
+        files = _enforce_buffer_cap(files)
         backlog.labels(**LBL).set(len(files))
         buffer_bytes.labels(**LBL).set(sum(p.stat().st_size for p in files))
         client = _s3()
