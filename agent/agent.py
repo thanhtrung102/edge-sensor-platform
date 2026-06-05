@@ -143,7 +143,9 @@ def capture_loop():
     if CAMERA_SOURCE == "webcam":
         import cv2
 
-        _webcam_frame.cap = cv2.VideoCapture(CAMERA_INDEX)
+        # DirectShow is the reliable backend on Windows; the MSMF default can stall on open.
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        _webcam_frame.cap = cv2.VideoCapture(CAMERA_INDEX, backend)
     interval = 1.0 / CAPTURE_FPS
     while True:
         start = time.time()
