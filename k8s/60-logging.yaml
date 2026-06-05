@@ -1,0 +1,120 @@
+# Log aggregation: single-binary Loki + a Promtail DaemonSet that tails every pod's stdout
+# on each node and ships parsed JSON to Loki. The "ELK half" of observability; maps to
+# CloudWatch Logs / OpenSearch on AWS. Grafana's Loki datasource is provisioned in 40-grafana.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: edge
+data:
+  loki-config.yml: |
+    auth_enabled: false
+    server: { http_listen_port: 3100, grpc_listen_port: 9095, log_level: warn }
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /tmp/loki
+      storage: { filesystem: { chunks_directory: /tmp/loki/chunks, rules_directory: /tmp/loki/rules } }
+      replication_factor: 1
+      ring: { kvstore: { store: inmemory } }
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index: { prefix: index_, period: 24h }
+    limits_config: { allow_structured_metadata: true, retention_period: 168h }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: edge
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loki } }
+  template:
+    metadata:
+      labels: { app: loki }
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.3.2
+          args: ["-config.file=/etc/loki/loki-config.yml"]
+          ports: [{ containerPort: 3100 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/loki }
+            - { name: data, mountPath: /tmp/loki }
+      volumes:
+        - name: config
+          configMap: { name: loki-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: edge
+spec:
+  selector: { app: loki }
+  ports: [{ port: 3100, targetPort: 3100 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: edge
+data:
+  promtail.yml: |
+    server: { http_listen_port: 9080, grpc_listen_port: 0 }
+    positions: { filename: /run/promtail/positions.yaml }
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs: [{ role: pod }]
+        pipeline_stages:
+          - cri: {}
+          - json:
+              expressions: { level: level, device_id: device_id, event: event }
+          - labels: { level: , device_id: , event: }
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+            target_label: __path__
+            separator: /
+            replacement: /var/log/pods/*$1/*.log
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: edge
+spec:
+  selector: { matchLabels: { app: promtail } }
+  template:
+    metadata:
+      labels: { app: promtail }
+    spec:
+      serviceAccountName: prometheus   # reuse the read ClusterRole (pods get/list/watch)
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.3.2
+          args: ["-config.file=/etc/promtail/promtail.yml"]
+          volumeMounts:
+            - { name: config, mountPath: /etc/promtail }
+            - { name: run, mountPath: /run/promtail }
+            - { name: pods, mountPath: /var/log/pods, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: promtail-config }
+        - name: run
+          emptyDir: {}
+        - name: pods
+          hostPath: { path: /var/log/pods }

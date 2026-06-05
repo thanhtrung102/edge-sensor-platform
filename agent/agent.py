@@ -9,7 +9,9 @@ set CAMERA_SOURCE=webcam to use a real USB camera via OpenCV.
 """
 import io
 import json
+import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -39,6 +41,30 @@ SENSORS = ["temperature_c", "vibration_g", "humidity_pct"]
 ANOMALY_RATE = float(os.getenv("ANOMALY_RATE", "0.03"))
 
 BUFFER_DIR.mkdir(parents=True, exist_ok=True)
+
+# ----------------------------------------------------------------------------- logging
+# Structured JSON logs to stdout so Promtail/Loki (or CloudWatch) can index them by
+# device/site/event. 12-factor: log to stdout, let the platform ship it.
+class _JsonLog(logging.Formatter):
+    def format(self, rec):
+        out = {
+            "ts": datetime.fromtimestamp(rec.created, timezone.utc).isoformat(),
+            "level": rec.levelname,
+            "device_id": DEVICE_ID,
+            "site": SITE,
+            "event": rec.getMessage(),
+        }
+        if isinstance(rec.args, dict):
+            out.update(rec.args)
+        return json.dumps(out)
+
+
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(_JsonLog())
+log = logging.getLogger("edge-agent")
+log.setLevel(logging.INFO)
+log.addHandler(_handler)
+log.propagate = False
 
 # ----------------------------------------------------------------------------- metrics
 LBL = {"device_id": DEVICE_ID, "site": SITE}
@@ -89,6 +115,7 @@ def _read_sensors() -> dict:
         if rng.random() < ANOMALY_RATE:  # inject an occasional spike
             val *= rng.uniform(2.5, 4.0)
             anomalies.labels(**LBL, sensor=s).inc()
+            log.warning("sensor_anomaly", {"sensor": s, "value": round(float(val), 3)})
         out[s] = round(float(val), 3)
     return out
 
@@ -144,17 +171,25 @@ def upload_loop():
         backlog.labels(**LBL).set(len(files))
         buffer_bytes.labels(**LBL).set(sum(p.stat().st_size for p in files))
         client = _s3()
+        sent = 0
         for path in files:
             try:
                 client.upload_file(str(path), S3_BUCKET, _key_for(path))
                 path.unlink(missing_ok=True)
                 uploads.labels(**LBL, status="success").inc()
                 last_upload.labels(**LBL).set(time.time())
+                sent += 1
+                if not STATE["online"]:
+                    log.info("backend_reconnected", {"backlog_drained_from": len(files)})
                 STATE["online"] = True
-            except (EndpointConnectionError, ClientError, OSError):
+            except (EndpointConnectionError, ClientError, OSError) as exc:
                 uploads.labels(**LBL, status="failed").inc()
+                if STATE["online"]:
+                    log.warning("backend_unreachable", {"backlog": len(files), "error": type(exc).__name__})
                 STATE["online"] = False
                 break  # backend down — keep buffer, retry next cycle (offline tolerance)
+        if sent:
+            log.info("upload_batch", {"uploaded": sent, "remaining_backlog": len(files) - sent})
         time.sleep(UPLOAD_INTERVAL)
 
 
@@ -181,5 +216,7 @@ def healthz():
 
 @app.on_event("startup")
 def _start():
+    log.info("agent_starting", {"camera_source": CAMERA_SOURCE, "fps": CAPTURE_FPS,
+                                "bucket": S3_BUCKET, "endpoint": S3_ENDPOINT})
     threading.Thread(target=capture_loop, daemon=True).start()
     threading.Thread(target=upload_loop, daemon=True).start()

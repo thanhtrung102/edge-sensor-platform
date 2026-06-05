@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - 10-minio.yaml
+  - 20-agent.yaml
+  - 30-prometheus.yaml
+  - 40-grafana.yaml
+  - 50-pipeline-cronjob.yaml
+  - 60-logging.yaml
+
+# Grafana dashboard JSON kept as the single source of truth under observability/ and
+# surfaced into the cluster as a ConfigMap.
+configMapGenerator:
+  - name: grafana-dashboards
+    namespace: edge
+    files:
+      - fleet.json=../observability/grafana/dashboards/fleet.json
+
+generatorOptions:
+  disableNameSuffixHash: true

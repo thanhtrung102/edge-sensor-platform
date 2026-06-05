@@ -1,0 +1,8 @@
+target/
+dbt_packages/
+logs/
+edge.duckdb
+edge.duckdb.wal
+landing/*.parquet
+landing/*.ndjson
+.user.yml

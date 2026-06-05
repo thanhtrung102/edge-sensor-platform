@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: mart_capture_health
+    description: Per device/hour realized capture completeness vs configured cadence.
+    columns:
+      - name: capture_rate_pct
+        description: readings landed / expected (CAPTURE_FPS * 3600), as a percent.
+        tests: [not_null]
+      - name: device_id
+        tests: [not_null]
+      - name: capture_hour
+        tests: [not_null]
+
+  - name: mart_sensor_quality
+    description: Per device/sensor/hour distribution summary.
+    columns:
+      - name: n
+        tests: [not_null]
+      - name: sensor
+        tests:
+          - accepted_values:
+              values: ["temperature_c", "vibration_g", "humidity_pct"]
+
+  - name: mart_anomalies
+    description: Readings whose robust z-score exceeds the configured sigma threshold.
+    columns:
+      - name: severity
+        tests:
+          - accepted_values:
+              values: ["warning", "critical"]
+      - name: robust_z
+        tests: [not_null]

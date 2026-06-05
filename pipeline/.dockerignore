@@ -1,0 +1,6 @@
+target/
+dbt_packages/
+logs/
+landing/
+edge.duckdb*
+__pycache__/

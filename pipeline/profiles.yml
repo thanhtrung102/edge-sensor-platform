@@ -1,0 +1,12 @@
+# dbt-duckdb profile. Reads the compacted landing parquet written by extract.py and
+# materializes marts into a local DuckDB file (pipeline/edge.duckdb). Self-contained:
+# no warehouse, no cloud account. Mirrors a Glue/Athena-style transform layer.
+edge_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: edge.duckdb
+      threads: 4
+      extensions:
+        - httpfs

@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: landing
+    description: >
+      Compacted parquet written by extract.py from the S3-compatible object store
+      (one row per captured reading / frame object).
+    meta:
+      external_location: "read_parquet('landing/{name}.parquet')"
+    tables:
+      - name: sensor_readings
+        description: One row per capture with all sensor values plus s3_key/ts.
+      - name: frame_index
+        description: One row per uploaded frame object (s3_key, size_bytes).

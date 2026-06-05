@@ -10,13 +10,16 @@ shape of a real sensor-data-collection operation — and to run **entirely local
 
 ## Architecture
 ```
- EDGE (hardware)                 CLOUD / PIPELINE              OBSERVABILITY
- Edge Agent (FastAPI)            MinIO (S3 object store)       Prometheus ─┐
-  • camera (synthetic|webcam)     edge-data/                    Grafana  ◀─┘ (fleet dashboard)
-  • sensors + anomaly inject  ──▶  {device}/frames/...     ──▶  Alertmanager-ready rules:
-  • local ring-buffer (retry)      {device}/sensors/...          stall · backlog · anomaly · agent-down
-  • /metrics + /healthz
+ EDGE (hardware)                 CLOUD / STORAGE              ANALYTICS            OBSERVABILITY
+ Edge Agent (FastAPI)            MinIO (S3 object store)      dbt + DuckDB         Prometheus ─┐
+  • camera (synthetic|webcam)     edge-data/                   extract.py (land)    Grafana  ◀─┘ metrics+alerts
+  • sensors + anomaly inject  ──▶  {device}/frames/...   ──▶   marts:          ──▶  Loki/Promtail
+  • local ring-buffer (retry)      {device}/sensors/...         capture_health       (structured JSON logs)
+  • /metrics + /healthz + JSON logs                            sensor_quality
+                                                               anomalies
 ```
+Three deploy targets, same components: **Docker Compose**, **native processes** (no Docker),
+and **Kubernetes** (`k8s/` — k3s locally, EKS-portable).
 
 ## Quick start (Docker — zero hardware)
 ```bash
@@ -28,6 +31,12 @@ Then open:
 - **MinIO console:** http://localhost:9001  (minioadmin / minioadmin) — watch objects land under `edge-data/`
 - **Prometheus:** http://localhost:9090  (try `rate(edge_frames_captured_total[1m])`; Alerts tab)
 - **Grafana:** http://localhost:3000  (admin / admin) → dashboard **"Edge Fleet — Capture & Health"**
+- **Loki** (logs): in Grafana → Explore → Loki → `{job="docker", event="sensor_anomaly"} | json`
+
+Run the analytics pass once data has landed:
+```bash
+docker compose run --rm pipeline      # extract -> landing parquet -> dbt build (marts + tests)
+```
 
 ## Run natively (no Docker — verified on Windows)
 If Docker isn't available, every component runs as a native process. This exact path was verified
@@ -40,9 +49,13 @@ S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=edge-data BUFFER_DIR=./buf \
 # 2. MinIO (single binary)        → bin/minio.exe server ./miniodata --console-address :9001
 # 3. Prometheus (single binary)   → prometheus --config.file=observability/prometheus.local.yml
 # 4. Grafana 13 (grafana.exe)     → GF_PATHS_PROVISIONING=observability/grafana/provisioning-local grafana.exe server
+# 5. Loki + Promtail (binaries)   → loki -config.file=observability/loki-config.yml
+#                                   promtail -config.file=observability/promtail.local.yml (tails logs/agent.log)
+# 6. Analytics (venv)             → cd pipeline && python extract.py && dbt build --profiles-dir .
 ```
-`prometheus.local.yml` and `grafana/provisioning-local/` target `127.0.0.1` (vs the Docker DNS names in
-the compose path). Sample rendered dashboard: `observability/grafana-dashboard.png`.
+`prometheus.local.yml`, `grafana/provisioning-local/`, and `promtail.local.yml` target `127.0.0.1`
+(vs the Docker DNS names in the compose path). Run the agent with stdout redirected to `logs/agent.log`
+so Promtail can tail it. Sample rendered dashboard: `observability/grafana-dashboard.png`.
 
 ![Edge Fleet dashboard](observability/grafana-dashboard.png)
 
@@ -55,21 +68,34 @@ CAMERA_SOURCE=webcam S3_ENDPOINT=http://localhost:9000 BUFFER_DIR=./buf \
   uvicorn agent:app --app-dir agent --port 8000
 ```
 
-## Demonstrate field reliability (offline buffering)
+## Demonstrate field reliability (offline buffering) — verified live
 ```bash
 docker compose stop minio        # simulate the object store going offline
-# → agent keeps capturing; edge_upload_backlog_files climbs; EdgeUploadBacklogHigh alert fires
-docker compose start minio       # backlog drains automatically on reconnect
+# → agent keeps capturing; edge_upload_backlog_files climbs; EdgeUploadBacklogHigh alert fires;
+#   agent logs {"event":"backend_unreachable"} to Loki
+docker compose start minio       # backlog drains automatically; alert resolves;
+#   agent logs {"event":"backend_reconnected","backlog_drained_from":N}
 ```
+Verified end-to-end on the native stack: MinIO stopped → backlog climbed 22→250 → `EdgeUploadBacklogHigh`
+went pending (60>50) then **fired** after its 30s `for`; MinIO restarted → backlog drained <50 in ~18s →
+alert **resolved**; the whole incident is reconstructable in Loki from the agent's `backend_unreachable`
+→ `backend_reconnected` log lines.
+
+## Analytics pipeline (`pipeline/`)
+dbt + DuckDB marts over the landed objects (the open-source analogue of Glue/Athena/dbt-on-Athena).
+`extract.py` compacts thousands of tiny JSON objects into parquet, then `dbt build` produces
+**mart_capture_health**, **mart_sensor_quality**, **mart_anomalies** (+ tests). See [pipeline/README.md](pipeline/README.md).
+Verified live: 11,556 readings landed → 6 models, 8 tests pass, 1,040 anomalies independently recovered.
+
+## Kubernetes (`k8s/`)
+The whole stack as vanilla Kubernetes: edge agent as a **DaemonSet** (one per node = one per device,
+`DEVICE_ID` from the node name), MinIO, Prometheus (pod-discovery scrape + alerts), Grafana, Loki +
+Promtail DaemonSet, and a **CronJob** running the dbt pipeline every 15 min. `kubectl apply -k k8s/`
+on k3s locally; lifts to **EKS** by swapping MinIO for S3 (IRSA). See [k8s/README.md](k8s/README.md).
 
 ## What this demonstrates
-- **Data pipeline / object storage** (S3-compatible, partitioned by device/date/hour)
-- **Observability stack** (Prometheus metrics, Grafana dashboards, alert rules incl. a dead-man's-switch)
+- **Data pipeline / object storage** (S3-compatible, partitioned) + **dbt/DuckDB analytics marts**
+- **Observability stack** — metrics (Prometheus/Grafana, dead-man's-switch alerts) **and logs** (Loki/Promtail)
 - **On-site ops automation** (self-health, auto-restart, offline-tolerant retry, escalation alerts)
 - **Cameras/sensors + local storage** (USB-camera-ready, sensor telemetry, local ring-buffer)
-- **DevOps**: containerized; Kubernetes (k3s/EKS) manifests + CI/CD are the next layer (`k8s/`, planned)
-
-## Roadmap
-- `pipeline/` — dbt-duckdb over uploaded data → capture-rate / quality / anomaly marts
-- `k8s/` — k3s manifests (agent as DaemonSet, CronJobs for dbt) → portable to EKS
-- Loki/Promtail for log aggregation (the "ELK" half of the observability requirement)
+- **DevOps / Kubernetes** — Docker Compose, native, and k3s/EKS manifests (DaemonSet + CronJob)

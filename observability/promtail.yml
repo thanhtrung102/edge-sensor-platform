@@ -1,0 +1,39 @@
+# Promtail (Docker compose variant): tails container stdout from the Docker json-file logs,
+# unwraps the docker envelope, parses the agent's structured JSON, and ships to Loki with
+# device_id / site / level / event as indexed labels.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: docker
+          __path__: /var/lib/docker/containers/*/*-json.log
+    pipeline_stages:
+      - json:
+          expressions:
+            log: log
+            stream: stream
+      - output:
+          source: log
+      # the agent emits JSON; pull out fields as labels where useful
+      - json:
+          expressions:
+            level: level
+            device_id: device_id
+            site: site
+            event: event
+      - labels:
+          level:
+          device_id:
+          site:
+          event:

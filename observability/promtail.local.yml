@@ -1,0 +1,35 @@
+# Promtail (native / no-Docker variant): tails the agent log file written under logs/ and
+# ships parsed JSON to a locally-run Loki on 127.0.0.1:3100.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: ./logs/positions.yaml
+
+clients:
+  - url: http://127.0.0.1:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: edge-agent
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: edge-agent
+          __path__: ./logs/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            device_id: device_id
+            site: site
+            event: event
+            ts: ts
+      - timestamp:
+          source: ts
+          format: RFC3339Nano
+      - labels:
+          level:
+          device_id:
+          site:
+          event:

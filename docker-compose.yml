@@ -51,9 +51,27 @@ services:
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports: ["9090:9090"]
 
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./observability/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/tmp/loki
+    ports: ["3100:3100"]
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    depends_on: [loki]
+    volumes:
+      - ./observability/promtail.yml:/etc/promtail/promtail.yml:ro
+      # tail container stdout (the agent's structured JSON logs)
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
   grafana:
     image: grafana/grafana:latest
-    depends_on: [prometheus]
+    depends_on: [prometheus, loki]
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
@@ -62,6 +80,21 @@ services:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
 
+  # On-demand analytics: `docker compose run --rm pipeline`
+  # (extract raw objects -> landing parquet -> dbt build). Profile-gated so it does
+  # not run as a long-lived service on `up`.
+  pipeline:
+    build: ./pipeline
+    profiles: ["pipeline"]
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-edge-data}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+
 volumes:
   minio-data:
   agent-buffer:
+  loki-data:

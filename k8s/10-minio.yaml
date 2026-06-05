@@ -1,0 +1,92 @@
+# S3-compatible object store (the open-source stand-in for S3). On EKS you would delete
+# this file and point the agent + pipeline at a real S3 bucket via IRSA instead.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: object-store
+  namespace: edge
+type: Opaque
+stringData:
+  access-key: minioadmin
+  secret-key: minioadmin
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: edge
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: object-store, key: access-key } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: object-store, key: secret-key } }
+          ports:
+            - { containerPort: 9000, name: s3 }
+            - { containerPort: 9001, name: console }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: minio-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: edge
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# one-shot job: create the edge-data bucket
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: edge
+spec:
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+          command: ["sh", "-c"]
+          args:
+            - |
+              until mc alias set local http://minio:9000 "$AK" "$SK"; do sleep 2; done
+              mc mb --ignore-existing local/edge-data
+          env:
+            - name: AK
+              valueFrom: { secretKeyRef: { name: object-store, key: access-key } }
+            - name: SK
+              valueFrom: { secretKeyRef: { name: object-store, key: secret-key } }

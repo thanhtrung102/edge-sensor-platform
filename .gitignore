@@ -3,6 +3,7 @@
 buf/
 miniodata/
 bin/
+logs/
 .env
 __pycache__/
 *.pyc
