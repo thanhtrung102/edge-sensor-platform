@@ -12,6 +12,7 @@ The whole edge-to-cloud stack as Kubernetes objects. Designed to run on a single
 | `30-prometheus.yaml` | Deployment + RBAC + ConfigMap | pod-discovery scraping + the fleet alert rules |
 | `40-grafana.yaml` | Deployment + Service (NodePort 30300) | auto-provisioned datasource + the Edge Fleet dashboard |
 | `50-pipeline-cronjob.yaml` | **CronJob** (*/15m) | extract + `dbt build` over landed data |
+| `60-logging.yaml` | **Loki** Deployment + **Promtail** DaemonSet + Service | log aggregation (the "ELK" half); ships pod stdout to Grafana's Loki datasource |
 | `kustomization.yaml` | — | ties it together; generates the dashboard ConfigMap from `observability/.../fleet.json` |
 
 ## Run on k3s
@@ -37,7 +38,8 @@ The manifests are vanilla Kubernetes — `kubectl apply -k` works unchanged on E
 fully managed:
 - **Object store**: delete `10-minio.yaml`; point `S3_ENDPOINT` at real S3 (or drop it and
   use the default AWS endpoint) and grant the agent/pipeline an **IRSA** role instead of the
-  static `object-store` secret.
+  static `object-store` secret. The bucket + least-priv IAM + IRSA role are provisioned in
+  [`../terraform/`](../terraform/README.md).
 - **Metrics**: replace the self-hosted Prometheus with the `kube-prometheus-stack` Helm
   chart or **Amazon Managed Prometheus**; the pod annotations stay the same.
 - **Scheduling**: the CronJob runs as-is; or trigger it from EventBridge → a Glue/dbt job.
@@ -45,5 +47,6 @@ fully managed:
 Mapping recap: **MinIO→S3, DaemonSet→edge fleet, CronJob→EventBridge-scheduled job,
 Prometheus→AMP/CloudWatch, k3s→EKS**.
 
-> Validated with `kubectl --dry-run` / `kustomize build` (manifests render & schema-validate).
-> A live apply needs a cluster + the two images built above.
+> CI validates that these manifests render via `kustomize build` on every push
+> (see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). A live apply needs a cluster
+> + the two images built above.

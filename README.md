@@ -8,7 +8,9 @@ upload to **S3-compatible object storage** with retry, and surface **fleet healt
 **Prometheus/Grafana** observability stack. Built to mirror the edge + cloud + observability + on-site-ops
 shape of a real sensor-data-collection operation — and to run **entirely locally, free, with no cloud account**.
 
-> Designed as an open-source stack that maps 1:1 to AWS: **MinIO→S3, k3s→EKS, Prometheus/Grafana→CloudWatch**.
+> Designed as an open-source stack that maps 1:1 to AWS: **MinIO→S3, k3s→EKS,
+> Prometheus/Grafana→CloudWatch, Loki→CloudWatch Logs, dbt-duckdb→Glue/Athena** — with real
+> **Terraform** for the AWS S3 landing target ([`terraform/`](terraform/README.md)).
 
 ## Architecture
 ```
