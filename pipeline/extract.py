@@ -5,7 +5,7 @@ job lists the sensor/ and frames/ prefixes, pulls the sensor JSON bodies concurr
 and writes two compacted parquet files into the dbt landing zone:
 
     landing/sensor_readings.parquet   one row per capture (device, site, ts, sensor values)
-    landing/frame_index.parquet       one row per frame object (device key, size) - keys only
+    landing/frame_index.parquet       one row per camera frame recovered from MCAP segments
 
 dbt-duckdb then builds marts on top. Mirrors a real "land raw -> transform" pipeline and
 keeps duckdb off the slow per-object HTTP path (it reads local parquet instead).
@@ -21,6 +21,8 @@ import boto3
 import duckdb
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+from mcap_index import frames_from_segment
 
 ENDPOINT = os.getenv("S3_ENDPOINT", "http://127.0.0.1:9000")
 BUCKET = os.getenv("S3_BUCKET", "edge-data")
@@ -104,19 +106,30 @@ def main():
     print(f"wrote sensor_readings.parquet ({len(sensor_keys)} rows)", flush=True)
     ndjson.unlink(missing_ok=True)
 
-    # --- frame index: keys + sizes only (no body download needed) ---
-    frames = list(_list(s3, "frames"))
+    # --- frame index: one row per camera frame recovered from MCAP recording segments ---
+    # Camera frames live inside rotated MCAP segments (recording plane), so we open each segment
+    # and walk its /camera channel rather than listing one object per frame.
+    recording_keys = [k for k, _ in _list(s3, "recordings")]
     frames_ndjson = LANDING / "_frames.ndjson"
+    frame_rows = skipped_segs = 0
     with frames_ndjson.open("w", encoding="utf-8") as fh:
-        for k, sz in frames:
-            fh.write(json.dumps({"s3_key": k, "size_bytes": sz}) + "\n")
+        for key in recording_keys:
+            try:
+                body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+                for row in frames_from_segment(body, key):
+                    fh.write(json.dumps(row) + "\n")
+                    frame_rows += 1
+            except Exception:
+                skipped_segs += 1  # tolerate a partial/corrupt segment, same as sensor objects
+    if skipped_segs:
+        print(f"skipped {skipped_segs} unreadable recording segments", flush=True)
     frames_pq = (LANDING / "frame_index.parquet").as_posix()
-    if frames:
+    if frame_rows:
         con.execute(
             f"COPY (SELECT * FROM read_json_auto('{frames_ndjson.as_posix()}')) "
             f"TO '{frames_pq}' (FORMAT parquet)"
         )
-    print(f"wrote frame_index.parquet ({len(frames)} rows)", flush=True)
+    print(f"wrote frame_index.parquet ({frame_rows} frames from {len(recording_keys)} segments)", flush=True)
     frames_ndjson.unlink(missing_ok=True)
 
 

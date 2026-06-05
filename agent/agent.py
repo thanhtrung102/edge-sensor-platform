@@ -25,12 +25,17 @@ from fastapi import FastAPI, Response
 from PIL import Image, ImageDraw
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 
+from recording import McapSegmentWriter
+
 # ----------------------------------------------------------------------------- config
 DEVICE_ID = os.getenv("DEVICE_ID", "edge-001")
 SITE = os.getenv("SITE", "hanoi-lab")
 CAPTURE_FPS = float(os.getenv("CAPTURE_FPS", "2"))
 CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "synthetic")  # synthetic | webcam
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+# Recording plane: mcap = rotate frames into MCAP segments (robot-bag, kills small-files at source);
+# jpeg = legacy one-object-per-frame path (kept for back-compat / simple webcam debugging).
+RECORDING_FORMAT = os.getenv("RECORDING_FORMAT", "mcap")  # mcap | jpeg
 BUFFER_DIR = Path(os.getenv("BUFFER_DIR", "/data/buffer"))
 UPLOAD_INTERVAL = float(os.getenv("UPLOAD_INTERVAL", "5"))
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
@@ -78,6 +83,8 @@ anomalies = Counter("edge_sensor_anomaly_total", "Sensor anomalies detected", ["
 backlog = Gauge("edge_upload_backlog_files", "Files awaiting upload in local buffer", ["device_id", "site"])
 buffer_bytes = Gauge("edge_buffer_disk_bytes", "Local buffer size on disk (bytes)", ["device_id", "site"])
 evicted = Counter("edge_buffer_evicted_total", "Buffered files dropped (oldest-first) at buffer cap", ["device_id", "site"])
+segments = Counter("edge_recording_segments_total", "MCAP recording segments rotated + sealed", ["device_id", "site"])
+capture_skew = Gauge("edge_capture_ingest_skew_seconds", "Seconds between capture time and local ingest (the PTP/clock-sync seam)", ["device_id", "site"])
 last_capture = Gauge("edge_last_capture_timestamp_seconds", "Unix ts of last capture", ["device_id", "site"])
 last_upload = Gauge("edge_last_successful_upload_timestamp_seconds", "Unix ts of last upload", ["device_id", "site"])
 sensor_reading = Gauge("edge_sensor_reading", "Latest sensor reading", ["device_id", "site", "sensor"])
@@ -124,6 +131,14 @@ def _read_sensors() -> dict:
     return out
 
 
+def _on_segment_sealed(path: Path, frames: int):
+    segments.labels(**LBL).inc()
+    log.info("segment_sealed", {"segment": path.name, "frames": frames})
+
+
+_recorder = McapSegmentWriter(BUFFER_DIR, DEVICE_ID, on_rotate=_on_segment_sealed)
+
+
 def capture_loop():
     if CAMERA_SOURCE == "webcam":
         import cv2
@@ -139,15 +154,20 @@ def capture_loop():
             else:
                 ts = datetime.now(timezone.utc)
                 stamp = ts.strftime("%Y%m%dT%H%M%S%f")
-                (BUFFER_DIR / f"frame_{stamp}.jpg").write_bytes(frame)
                 readings = _read_sensors()
                 for s, v in readings.items():
                     sensor_reading.labels(**LBL, sensor=s).set(v)
-                (BUFFER_DIR / f"sensors_{stamp}.json").write_text(
-                    json.dumps({"device_id": DEVICE_ID, "site": SITE, "ts": ts.isoformat(), **readings})
-                )
+                sensor_record = {"device_id": DEVICE_ID, "site": SITE, "ts": ts.isoformat(), **readings}
+                # Telemetry plane: small high-rate sensor scalars (stay as their own objects).
+                (BUFFER_DIR / f"sensors_{stamp}.json").write_text(json.dumps(sensor_record))
+                # Recording plane: heavy camera frames into rotating MCAP segments (or legacy jpeg).
+                if RECORDING_FORMAT == "mcap":
+                    _recorder.append(frame, sensor_record, ts)
+                else:
+                    (BUFFER_DIR / f"frame_{stamp}.jpg").write_bytes(frame)
                 frames_captured.labels(**LBL).inc()
                 last_capture.labels(**LBL).set(time.time())
+                capture_skew.labels(**LBL).set(max(0.0, time.time() - ts.timestamp()))
                 STATE["frames"] += 1
         except Exception:
             frames_dropped.labels(**LBL).inc()
@@ -178,8 +198,11 @@ def _capture_time(path: Path) -> datetime:
         return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
 
 
+_KIND_BY_SUFFIX = {".mcap": "recordings", ".jpg": "frames", ".json": "sensors"}
+
+
 def _key_for(path: Path) -> str:
-    kind = "frames" if path.suffix == ".jpg" else "sensors"
+    kind = _KIND_BY_SUFFIX.get(path.suffix, "sensors")
     t = _capture_time(path)
     return f"{DEVICE_ID}/{kind}/{t:%Y/%m/%d/%H}/{path.name}"
 
@@ -204,33 +227,47 @@ def _enforce_buffer_cap(files: list) -> list:
     return files[dropped:]
 
 
+def _upload_cycle():
+    # oldest-first by mtime so upload order and eviction order are both chronological.
+    # Skip *.part — the segment currently being written (not yet sealed for upload).
+    files = sorted(
+        (p for p in BUFFER_DIR.iterdir() if p.is_file() and p.suffix != ".part"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    files = _enforce_buffer_cap(files)
+    backlog.labels(**LBL).set(len(files))
+    buffer_bytes.labels(**LBL).set(sum(p.stat().st_size for p in files))
+    client = _s3()
+    sent = 0
+    for path in files:
+        try:
+            client.upload_file(str(path), S3_BUCKET, _key_for(path))
+            path.unlink(missing_ok=True)
+            uploads.labels(**LBL, status="success").inc()
+            last_upload.labels(**LBL).set(time.time())
+            sent += 1
+            if not STATE["online"]:
+                log.info("backend_reconnected", {"backlog_drained_from": len(files)})
+            STATE["online"] = True
+        except (EndpointConnectionError, ClientError, OSError) as exc:
+            uploads.labels(**LBL, status="failed").inc()
+            if STATE["online"]:
+                log.warning("backend_unreachable", {"backlog": len(files), "error": type(exc).__name__})
+            STATE["online"] = False
+            break  # backend down — keep buffer, retry next cycle (offline tolerance)
+    if sent:
+        log.info("upload_batch", {"uploaded": sent, "remaining_backlog": len(files) - sent})
+
+
 def upload_loop():
+    # A long-running field agent must self-heal: an unexpected error in one cycle (transient
+    # MemoryError under pressure, a surprise OSError) must not permanently kill the upload thread
+    # and silently strand the buffer. Catch broadly, log, and retry next interval.
     while True:
-        # oldest-first by mtime so upload order and eviction order are both chronological
-        files = sorted((p for p in BUFFER_DIR.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime)
-        files = _enforce_buffer_cap(files)
-        backlog.labels(**LBL).set(len(files))
-        buffer_bytes.labels(**LBL).set(sum(p.stat().st_size for p in files))
-        client = _s3()
-        sent = 0
-        for path in files:
-            try:
-                client.upload_file(str(path), S3_BUCKET, _key_for(path))
-                path.unlink(missing_ok=True)
-                uploads.labels(**LBL, status="success").inc()
-                last_upload.labels(**LBL).set(time.time())
-                sent += 1
-                if not STATE["online"]:
-                    log.info("backend_reconnected", {"backlog_drained_from": len(files)})
-                STATE["online"] = True
-            except (EndpointConnectionError, ClientError, OSError) as exc:
-                uploads.labels(**LBL, status="failed").inc()
-                if STATE["online"]:
-                    log.warning("backend_unreachable", {"backlog": len(files), "error": type(exc).__name__})
-                STATE["online"] = False
-                break  # backend down — keep buffer, retry next cycle (offline tolerance)
-        if sent:
-            log.info("upload_batch", {"uploaded": sent, "remaining_backlog": len(files) - sent})
+        try:
+            _upload_cycle()
+        except Exception as exc:
+            log.warning("upload_cycle_error", {"error": type(exc).__name__})
         time.sleep(UPLOAD_INTERVAL)
 
 
@@ -245,11 +282,15 @@ def metrics():
 
 @app.get("/healthz")
 def healthz():
-    pending = len([p for p in BUFFER_DIR.iterdir() if p.is_file()])
+    files = [p for p in BUFFER_DIR.iterdir() if p.is_file() and p.suffix != ".part"]
+    telemetry = sum(1 for p in files if p.suffix == ".json")
+    recordings = sum(1 for p in files if p.suffix in (".mcap", ".jpg"))
     return {
         "device_id": DEVICE_ID, "site": SITE, "camera_source": CAMERA_SOURCE,
+        "recording_format": RECORDING_FORMAT,
         "uptime_s": round(time.time() - STATE["started"], 1),
-        "frames_captured": STATE["frames"], "upload_backlog": pending,
+        "frames_captured": STATE["frames"], "upload_backlog": len(files),
+        "backlog_telemetry": telemetry, "backlog_recordings": recordings,
         "backend_online": STATE["online"],
         "status": "ok" if STATE["frames"] > 0 else "starting",
     }
@@ -258,6 +299,14 @@ def healthz():
 @app.on_event("startup")
 def _start():
     log.info("agent_starting", {"camera_source": CAMERA_SOURCE, "fps": CAPTURE_FPS,
+                                "recording_format": RECORDING_FORMAT,
                                 "bucket": S3_BUCKET, "endpoint": S3_ENDPOINT})
     threading.Thread(target=capture_loop, daemon=True).start()
     threading.Thread(target=upload_loop, daemon=True).start()
+
+
+@app.on_event("shutdown")
+def _stop():
+    # Seal the in-progress segment so its frames aren't lost on a clean shutdown.
+    if RECORDING_FORMAT == "mcap":
+        _recorder.rotate()

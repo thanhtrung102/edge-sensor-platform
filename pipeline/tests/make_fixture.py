@@ -30,8 +30,9 @@ con.execute(
     f"""
     COPY (
         SELECT
-            'edge-001/frames/2026/01/01/09/frame_20260101T0900' || lpad(s::VARCHAR, 2, '0') || '.jpg' AS s3_key,
-            12000 AS size_bytes
+            'edge-001/recordings/2026/01/01/09/seg_20260101T090000000000.mcap' AS segment_key,
+            TIMESTAMP '2026-01-01 09:00:00' + (s * INTERVAL 1 SECOND) AS captured_at,
+            15000 AS size_bytes
         FROM range(0, 60) t(s)
     ) TO '{(LANDING / 'frame_index.parquet').as_posix()}' (FORMAT parquet)
     """

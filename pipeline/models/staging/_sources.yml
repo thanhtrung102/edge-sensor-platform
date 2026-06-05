@@ -11,4 +11,4 @@ sources:
       - name: sensor_readings
         description: One row per capture with all sensor values plus s3_key/ts.
       - name: frame_index
-        description: One row per uploaded frame object (s3_key, size_bytes).
+        description: One row per camera frame recovered from an MCAP recording segment (segment_key, captured_at, size_bytes).

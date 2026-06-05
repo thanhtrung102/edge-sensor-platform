@@ -13,15 +13,26 @@ shape of a real sensor-data-collection operation — and to run **entirely local
 > **Terraform** for the AWS S3 landing target ([`terraform/`](terraform/README.md)).
 
 ## Architecture
+The agent splits telemetry into **two planes** the way real robot/fleet data collection does
+(cf. AWS's *Physical AI for Robotics* reference and Foxglove/MCAP):
 ```
  EDGE (hardware)                 CLOUD / STORAGE              ANALYTICS            OBSERVABILITY
  Edge Agent (FastAPI)            MinIO (S3 object store)      dbt + DuckDB         Prometheus ─┐
   • camera (synthetic|webcam)     edge-data/                   extract.py (land)    Grafana  ◀─┘ metrics+alerts
-  • sensors + anomaly inject  ──▶  {device}/frames/...   ──▶   marts:          ──▶  Loki/Promtail
-  • local ring-buffer (retry)      {device}/sensors/...         capture_health       (structured JSON logs)
-  • /metrics + /healthz + JSON logs                            sensor_quality
-                                                               anomalies
+  • sensors + anomaly inject       {device}/recordings/*.mcap  marts:          ──▶  Loki/Promtail
+     ├─ recording plane  ───────▶   (camera+sensor channels)    capture_health      (structured JSON logs)
+     │   → rotated MCAP segments    {device}/sensors/*.json     sensor_quality
+     └─ telemetry plane  ───────▶   (scalar readings)           anomalies
+  • local ring-buffer (retry, self-healing)  ──▶  (frames recovered from MCAP /camera channel)
+  • /metrics + /healthz + JSON logs
 ```
+- **Recording plane** — heavy camera frames are written into **rotated MCAP segments** (the ROS 2
+  default bag format; opens in Foxglove). One segment carries both a `/camera/jpeg` and a `/sensors`
+  channel with embedded schemas — so the small-files problem is solved *at the source* (hundreds of
+  frames → one self-describing object), not compacted after the fact.
+- **Telemetry plane** — small, high-rate sensor scalars stay as their own JSON objects (the on-ramp
+  to MQTT → AWS IoT Core).
+
 Three deploy targets, same components: **Docker Compose**, **native processes** (no Docker),
 and **Kubernetes** (`k8s/` — k3s locally, EKS-portable). A full captured run (every stage, real
 data at scale) is in [docs/E2E-RUN.md](docs/E2E-RUN.md).
@@ -107,10 +118,17 @@ on k3s locally; lifts to **EKS** by swapping MinIO for S3 (IRSA). See [k8s/READM
 - **CI/CD + IaC** — GitHub Actions (lint · agent tests · dbt build · image build · kustomize validate · `terraform validate`) and **Terraform** for the real AWS S3 landing target (`terraform/`)
 
 ## Reliability & correctness details
+- **MCAP recording segments** — camera frames are recorded into rotating, self-describing MCAP
+  segments (`SEGMENT_SECONDS`/`SEGMENT_MAX_FRAMES`), written to a `*.part` temp and **atomically
+  renamed** on seal so the upload loop never ships a half-written segment. Capture time is preserved
+  in the message log-time, so frames recovered downstream stay partition-correct.
 - **Capture-time partitioning** — objects are keyed by their *capture* time (parsed from the buffered
-  filename), not upload time, so data buffered through an outage still lands in the correct `Y/M/D/H`
-  partition (otherwise late arrivals scatter into the wrong hour and break partition pruning).
+  filename / MCAP message time), not upload time, so data buffered through an outage still lands in
+  the correct `Y/M/D/H` partition (otherwise late arrivals scatter into the wrong hour and break pruning).
 - **Bounded store-and-forward buffer** — past `MAX_BUFFER_BYTES` the agent drops oldest-first
   (`edge_buffer_evicted_total`), so a long outage can't fill the disk and take the node down.
+- **Self-healing upload loop** — an unexpected error in one upload cycle (transient `MemoryError`
+  under pressure, a surprise `OSError`) is caught and retried next interval instead of permanently
+  killing the upload thread and silently stranding the buffer.
 - **Tested** — `pytest tests/` covers the partitioning and buffer-eviction logic; `dbt test` covers
   the marts. Both run in CI on every push.

@@ -17,7 +17,9 @@ os.environ.setdefault("BUFFER_DIR", tempfile.mkdtemp(prefix="edgebuf_"))
 os.environ.setdefault("S3_ENDPOINT", "http://127.0.0.1:9")
 os.environ.setdefault("DEVICE_ID", "edge-001")
 
-_AGENT_PY = Path(__file__).resolve().parents[1] / "agent" / "agent.py"
+_AGENT_DIR = Path(__file__).resolve().parents[1] / "agent"
+sys.path.insert(0, str(_AGENT_DIR))  # so agent.py can `import recording`
+_AGENT_PY = _AGENT_DIR / "agent.py"
 _spec = importlib.util.spec_from_file_location("agent_under_test", _AGENT_PY)
 agent = importlib.util.module_from_spec(_spec)
 sys.modules["agent_under_test"] = agent
@@ -78,3 +80,51 @@ def test_enforce_buffer_cap_noop_under_limit(tmp_path):
     survivors = agent._enforce_buffer_cap(list(files))
     assert survivors == files
     assert all(p.exists() for p in files)
+
+
+# --------------------------------------------------------------------------- recording plane
+def test_capture_time_parses_segment_stamp():
+    """MCAP segments are named seg_<stamp>; they must partition by capture time like frames do."""
+    t = agent._capture_time(Path("seg_20260605T154732374989.mcap"))
+    assert t == datetime(2026, 6, 5, 15, 47, 32, 374989, tzinfo=timezone.utc)
+
+
+def test_key_routes_mcap_to_recordings(tmp_path):
+    p = _touch(tmp_path / "seg_20260101T090000000000.mcap")
+    assert agent._key_for(p).startswith("edge-001/recordings/2026/01/01/09/")
+
+
+def test_key_routes_three_planes(tmp_path):
+    assert "/recordings/" in agent._key_for(Path("seg_20260101T090000000000.mcap"))
+    assert "/sensors/" in agent._key_for(Path("sensors_20260101T090000000000.json"))
+    assert "/frames/" in agent._key_for(Path("frame_20260101T090000000000.jpg"))
+
+
+def test_mcap_segment_writer_rotates_and_carries_both_channels(tmp_path):
+    """The recording plane must seal a segment with both camera + sensor channels, and the
+    sealed file (seg_*.mcap, not the *.part temp) must be what's left for the upload loop."""
+    from collections import Counter
+
+    from mcap.reader import make_reader
+
+    from recording import McapSegmentWriter
+
+    import recording
+    recording.SEGMENT_SECONDS = 9999       # rotate strictly on frame count for the test
+    recording.SEGMENT_MAX_FRAMES = 3
+
+    sealed = []
+    w = McapSegmentWriter(tmp_path, "edge-001", on_rotate=lambda p, n: sealed.append((p, n)))
+    base = datetime(2026, 6, 5, 10, 0, 0, tzinfo=timezone.utc)
+    for i in range(3):
+        ts = base.replace(second=i)
+        w.append(b"\xff\xd8jpeg" + bytes([i]), {"device_id": "edge-001", "ts": ts.isoformat()}, ts)
+
+    assert len(sealed) == 1 and sealed[0][1] == 3            # one segment, three frames
+    seg_path = sealed[0][0]
+    assert seg_path.suffix == ".mcap" and seg_path.exists()
+    assert not list(tmp_path.glob("*.part"))                 # temp renamed away
+
+    with seg_path.open("rb") as fh:
+        ch = Counter(c.topic for _s, c, _m in make_reader(fh).iter_messages())
+    assert ch["/camera/jpeg"] == 3 and ch["/sensors"] == 3

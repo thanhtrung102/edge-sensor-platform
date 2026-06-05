@@ -6,6 +6,32 @@ cloud account), exercising every stage with **real data at scale**. Run date: 20
 > Reproduce: `docker compose up -d --build` then `docker compose run --rm pipeline` (Docker),
 > or the native commands in the [README](../README.md). CI re-runs the pipeline + tests on every push.
 
+## Update — two-plane architecture: camera frames as MCAP recording segments
+The platform was refactored to the two-plane shape real robot/fleet data collection uses (per AWS's
+*Physical AI for Robotics* reference and Foxglove/MCAP):
+
+- **Recording plane** — camera frames are now written into **rotated MCAP segments** (`agent/recording.py`,
+  the ROS 2 default bag format) instead of one JPEG object per frame. Each segment carries a `/camera/jpeg`
+  and a `/sensors` channel with embedded schemas, is written to a `*.part` temp and **atomically renamed**
+  on seal, and is shipped by the existing store-and-forward upload loop. This **kills the small-files
+  problem at the source** (hundreds of frames → one self-describing object) and the segments open in Foxglove.
+- **Telemetry plane** — small high-rate sensor scalars stay as their own JSON objects (the MQTT/IoT-Core on-ramp).
+- The pipeline (`pipeline/mcap_index.py` + `extract.py`) recovers a per-frame index by walking each segment's
+  `/camera` channel, taking capture time from the message log-time (partition-correct).
+
+**Verified live (2026-06-05):**
+- Agent restarted on the new code → `recording_format: mcap`; MinIO `edge-001/recordings/Y/M/D/H/` filled with
+  `seg_*.mcap` (~613 KiB = **61 frames per object** vs 61 separate JPEGs). A pulled segment round-trips:
+  channels `/camera/jpeg`+`/sensors` (61 each), embedded schemas `foxglove.CompressedImage`+`edge.SensorReading`,
+  capture-hour matches the partition, and a `/camera` message base64-decodes to a valid JPEG (`FF D8`).
+- New metrics `edge_recording_segments_total` + `edge_capture_ingest_skew_seconds` scraped by Prometheus.
+- **Pipeline on real recorded data**: **40 segments → 2,440 frames** recovered, paired with 8,524 sensor
+  readings → `dbt build` **14 PASS**. `mart_capture_health` recovered frames-per-hour *from the MCAP segments*
+  (hour 15: 1,451 frames / 7,137 readings — recordings began at 15:47, so `reading_frame_skew` correctly flags
+  the camera plane starting mid-hour), 776 anomalies recovered.
+- A reliability bug surfaced and fixed: the upload loop now **self-heals** (wraps each cycle) instead of a
+  transient `MemoryError` permanently killing the upload thread.
+
 ## What this run also fixed (found by running at full scale)
 Running end-to-end against the full bucket surfaced three real bugs, all fixed in
 [`pipeline/extract.py`](../pipeline/extract.py):
