@@ -23,7 +23,8 @@ shape of a real sensor-data-collection operation — and to run **entirely local
                                                                anomalies
 ```
 Three deploy targets, same components: **Docker Compose**, **native processes** (no Docker),
-and **Kubernetes** (`k8s/` — k3s locally, EKS-portable).
+and **Kubernetes** (`k8s/` — k3s locally, EKS-portable). A full captured run (every stage, real
+data at scale) is in [docs/E2E-RUN.md](docs/E2E-RUN.md).
 
 ## Quick start (Docker — zero hardware)
 ```bash

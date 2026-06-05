@@ -8,7 +8,7 @@ open-source analogue of a Glue/Athena transform layer: `MinIO→S3`, `DuckDB→A
 ## Flow
 ```
 S3 (edge-data/{device}/sensors|frames/...)            many tiny JSON/JPEG objects
-        │  extract.py  (boto3, 32-way concurrent, compaction)
+        │  extract.py  (boto3, bounded concurrency + chunking, compaction)
         ▼
 landing/sensor_readings.parquet   landing/frame_index.parquet
         │  dbt run   (DuckDB)

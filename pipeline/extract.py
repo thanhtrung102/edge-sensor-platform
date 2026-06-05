@@ -20,12 +20,18 @@ from pathlib import Path
 import boto3
 import duckdb
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 ENDPOINT = os.getenv("S3_ENDPOINT", "http://127.0.0.1:9000")
 BUCKET = os.getenv("S3_BUCKET", "edge-data")
 KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 SECRET = os.getenv("S3_SECRET_KEY", "minioadmin")
 PREFIX = os.getenv("DEVICE_PREFIX", "")  # "" = all devices
+# Bounded concurrency + chunking so a very large bucket can't blow up memory:
+# we keep at most CHUNK keys' futures and WORKERS in-flight bodies at a time.
+WORKERS = int(os.getenv("EXTRACT_WORKERS", "8"))
+CHUNK = int(os.getenv("EXTRACT_CHUNK", "2000"))
+MAX_OBJECTS = int(os.getenv("EXTRACT_MAX_OBJECTS", "0"))  # 0 = no cap; else most-recent N
 LANDING = Path(__file__).parent / "landing"
 LANDING.mkdir(exist_ok=True)
 
@@ -52,17 +58,38 @@ def main():
 
     # --- sensor readings: fetch JSON bodies concurrently, stage as NDJSON ---
     sensor_keys = [k for k, _ in _list(s3, "sensors")]
-    print(f"sensor objects: {len(sensor_keys)}", flush=True)
+    if MAX_OBJECTS:
+        sensor_keys = sorted(sensor_keys)[-MAX_OBJECTS:]  # most-recent N (keys sort chronologically)
+    print(f"sensor objects: {len(sensor_keys)} (workers={WORKERS}, chunk={CHUNK})", flush=True)
     ndjson = LANDING / "_sensors.ndjson"
 
     def fetch(key):
-        rec = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+        # Tolerate corrupt/truncated objects (e.g. a partial upload left by a crash mid-write):
+        # skip them rather than aborting the whole run. Returns None on any read/parse failure.
+        try:
+            body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+            rec = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, ClientError):
+            return None
         rec["s3_key"] = key
         return json.dumps(rec)
 
-    with ndjson.open("w", encoding="utf-8") as fh, ThreadPoolExecutor(max_workers=32) as pool:
-        for line in pool.map(fetch, sensor_keys):
-            fh.write(line + "\n")
+    # Process in bounded chunks with a capped worker pool so we never materialize all
+    # object bodies / futures at once — the bucket can hold tens of thousands of objects.
+    written = skipped = 0
+    with ndjson.open("w", encoding="utf-8") as fh:
+        for i in range(0, len(sensor_keys), CHUNK):
+            chunk = sensor_keys[i:i + CHUNK]
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                for line in pool.map(fetch, chunk):
+                    if line is None:
+                        skipped += 1
+                        continue
+                    fh.write(line + "\n")
+                    written += 1
+            print(f"  fetched {min(i + CHUNK, len(sensor_keys))}/{len(sensor_keys)}", flush=True)
+    if skipped:
+        print(f"skipped {skipped} corrupt/unreadable objects", flush=True)
 
     con = duckdb.connect()
     sensors_pq = (LANDING / "sensor_readings.parquet").as_posix()
