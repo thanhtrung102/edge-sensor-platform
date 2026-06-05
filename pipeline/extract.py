@@ -92,6 +92,9 @@ def main():
         print(f"skipped {skipped} corrupt/unreadable objects", flush=True)
 
     con = duckdb.connect()
+    # Cap working memory and let DuckDB spill to disk rather than OOM on a huge bucket.
+    con.execute(f"SET memory_limit='{os.getenv('DUCKDB_MEMORY_LIMIT', '512MB')}'")
+    con.execute(f"SET temp_directory='{(LANDING / '_duckdb_tmp').as_posix()}'")
     sensors_pq = (LANDING / "sensor_readings.parquet").as_posix()
     if sensor_keys:
         con.execute(
