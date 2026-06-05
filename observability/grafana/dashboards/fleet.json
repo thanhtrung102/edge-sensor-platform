@@ -1,0 +1,59 @@
+{
+  "title": "Edge Fleet — Capture & Health",
+  "uid": "edge-fleet",
+  "tags": ["edge", "techvalley"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Agents up",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum(up{job=\"edge-agents\"})", "refId": "A" }],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [
+        { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Anomalies (5m)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "sum(increase(edge_sensor_anomaly_total[5m]))", "refId": "A" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Upload backlog (files)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sum(edge_upload_backlog_files)", "refId": "A" }],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 50 } ] } } }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Seconds since last capture",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "time() - max(edge_last_capture_timestamp_seconds)", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 30 } ] } } }
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Capture rate (frames/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{ "expr": "sum by (device_id) (rate(edge_frames_captured_total[1m]))", "legendFormat": "{{device_id}}", "refId": "A" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Uploads/s by status",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "sum by (status) (rate(edge_uploads_total[1m]))", "legendFormat": "{{status}}", "refId": "A" }]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Sensor readings",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [{ "expr": "edge_sensor_reading", "legendFormat": "{{sensor}}", "refId": "A" }]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Local buffer size (bytes)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "sum by (device_id) (edge_buffer_disk_bytes)", "legendFormat": "{{device_id}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    }
+  ]
+}

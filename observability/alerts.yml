@@ -1,0 +1,38 @@
+groups:
+  - name: edge-fleet
+    rules:
+      # Dead-man's-switch: capture has stalled (no new frame for 30s)
+      - alert: EdgeCaptureStalled
+        expr: time() - edge_last_capture_timestamp_seconds > 30
+        for: 15s
+        labels: { severity: critical }
+        annotations:
+          summary: "Capture stalled on {{ $labels.device_id }}"
+          description: "No frame captured for >30s — check the camera/agent on site {{ $labels.site }}."
+
+      # Upload backlog growing: backend likely unreachable (field connectivity)
+      - alert: EdgeUploadBacklogHigh
+        expr: edge_upload_backlog_files > 50
+        for: 30s
+        labels: { severity: warning }
+        annotations:
+          summary: "Upload backlog high on {{ $labels.device_id }}"
+          description: "{{ $value }} files buffered locally — object store unreachable or slow; escalate."
+
+      # Sensor anomaly burst
+      - alert: EdgeSensorAnomalyBurst
+        expr: increase(edge_sensor_anomaly_total[1m]) > 5
+        for: 0s
+        labels: { severity: warning }
+        annotations:
+          summary: "Sensor anomaly burst on {{ $labels.device_id }} ({{ $labels.sensor }})"
+          description: "More than 5 anomalies in the last minute."
+
+      # Agent down (scrape target unreachable)
+      - alert: EdgeAgentDown
+        expr: up{job="edge-agents"} == 0
+        for: 20s
+        labels: { severity: critical }
+        annotations:
+          summary: "Edge agent unreachable"
+          description: "Prometheus cannot scrape the agent — device offline or crashed."

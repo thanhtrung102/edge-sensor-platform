@@ -1,0 +1,8 @@
+# runtime / generated
+.venv/
+buf/
+miniodata/
+bin/
+.env
+__pycache__/
+*.pyc

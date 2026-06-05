@@ -1,0 +1,67 @@
+name: edge-sensor-platform
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio-data:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin} &&
+      mc mb -p local/${S3_BUCKET:-edge-data} &&
+      echo 'bucket ready';"
+
+  agent:
+    build: ./agent
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      DEVICE_ID: ${DEVICE_ID:-edge-001}
+      SITE: ${SITE:-hanoi-lab}
+      CAPTURE_FPS: ${CAPTURE_FPS:-2}
+      CAMERA_SOURCE: ${CAMERA_SOURCE:-synthetic}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-edge-data}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      BUFFER_DIR: /data/buffer
+    ports: ["8000:8000"]
+    volumes: ["agent-buffer:/data/buffer"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on: [agent]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+
+volumes:
+  minio-data:
+  agent-buffer:
