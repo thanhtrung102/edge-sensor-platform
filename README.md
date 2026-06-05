@@ -31,7 +31,7 @@ The agent splits telemetry into **two planes** the way real robot/fleet data col
   channel with embedded schemas — so the small-files problem is solved *at the source* (hundreds of
   frames → one self-describing object), not compacted after the fact.
 - **Telemetry plane** — small, high-rate sensor scalars stay as their own JSON objects (the on-ramp
-  to MQTT → AWS IoT Core).
+  to MQTT → AWS IoT Core; migration designed in [docs/ROADMAP-mqtt-iotcore.md](docs/ROADMAP-mqtt-iotcore.md)).
 
 Three deploy targets, same components: **Docker Compose**, **native processes** (no Docker),
 and **Kubernetes** (`k8s/` — k3s locally, EKS-portable). A full captured run (every stage, real
