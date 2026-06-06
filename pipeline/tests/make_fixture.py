@@ -1,7 +1,10 @@
-"""Generate tiny deterministic landing parquet so `dbt build` can run in CI without MinIO.
+"""Generate tiny DETERMINISTIC landing parquet so `dbt build` can run in CI without MinIO,
+and so repeated runs produce byte-identical marts (reproducibility).
 
-Writes the same two files extract.py would produce (sensor_readings.parquet, frame_index.parquet)
-with a single device, one hour of data, schema-identical to the real extract output.
+Writes the two files extract.py would produce (sensor_readings.parquet, frame_index.parquet)
+for a single device / one hour, schema-identical to the real extract output. `setseed` pins the
+RNG so the values are stable across runs; two deterministic temperature spikes (s = 17, 43) make
+mart_anomalies non-empty and stable, so the anomaly detector's output is verifiable run-to-run.
 """
 from pathlib import Path
 
@@ -10,6 +13,7 @@ import duckdb
 LANDING = Path(__file__).resolve().parents[1] / "landing"
 LANDING.mkdir(exist_ok=True)
 con = duckdb.connect()
+con.execute("SELECT setseed(0.42)")  # pin the RNG -> reproducible sensor values
 
 con.execute(
     f"""
@@ -18,7 +22,8 @@ con.execute(
             'edge-001' AS device_id,
             'hanoi-lab' AS site,
             TIMESTAMP '2026-01-01 09:00:00' + (s * INTERVAL 1 SECOND) AS ts,
-            round(42 + random() * 3, 3) AS temperature_c,
+            -- two deterministic spikes (s=17,43) so the robust-z anomaly mart has stable, non-zero output
+            round((42 + random() * 3) * CASE WHEN s IN (17, 43) THEN 3.5 ELSE 1 END, 3) AS temperature_c,
             round(0.5 + random() * 0.1, 3) AS vibration_g,
             round(55 + random() * 4, 3) AS humidity_pct,
             'edge-001/sensors/2026/01/01/09/sensors_20260101T0900' || lpad(s::VARCHAR, 2, '0') || '.json' AS s3_key
@@ -37,4 +42,4 @@ con.execute(
     ) TO '{(LANDING / 'frame_index.parquet').as_posix()}' (FORMAT parquet)
     """
 )
-print("fixture written:", LANDING)
+print("fixture written (deterministic, setseed=0.42):", LANDING)
